@@ -1,9 +1,8 @@
-version: "3.8"
 services:
   report-watcher:
     build: .
     environment:
-      MONGO_URI: mongodb://localhost:27017
+      MONGO_URI: mongodb://host.docker.internal:27017
       DB_NAME: mydb
       RECURSIVE: "true"
       SYNC_INTERVAL_SECONDS: "30"
@@ -11,4 +10,6 @@ services:
       - /mnt/d/Project/global-qa/report_history:/data/global-qa/report_history:ro
       - /mnt/d/Project/global-cn/report_history:/data/global-cn/report_history:ro
       - ./config.docker.json:/app/config.json:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     restart: unless-stopped
