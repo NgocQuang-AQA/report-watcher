@@ -143,8 +143,9 @@ Chạy:
 
 ```bash
 cd /path/to/report-watcher
-docker compose up -d --build
-docker compose logs -f report-watcher
+- docker compose down
+- docker compose up -d --build
+- docker compose logs -f report-watcher
 ```
 
 ### Dùng Docker thuần (tùy chọn)

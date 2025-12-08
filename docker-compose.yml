@@ -2,7 +2,7 @@ services:
   report-watcher:
     build: .
     environment:
-      MONGO_URI: mongodb://host.docker.internal:27017
+      MONGO_URI: mongodb://10.13.60.136:27017
       DB_NAME: mydb
       RECURSIVE: "true"
       SYNC_INTERVAL_SECONDS: "30"
