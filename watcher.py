@@ -353,9 +353,18 @@ if __name__ == "__main__":
     else:
         if WATCH_PATH and COLLECTION_NAME:
             targets.append((WATCH_PATH, db[COLLECTION_NAME], db[COLLECTION_NAME+"-summary"], db[COLLECTION_NAME+"-error"], db[COLLECTION_NAME+"-fail"]))
+    valid_targets = []
     for item in targets:
         p = item[0]
-        print(f"===== Watching folder: {p} =====")
+        if os.path.isdir(p):
+            print(f"===== Watching folder: {p} =====")
+            valid_targets.append(item)
+        else:
+            print(f"[WARN] Watch path not found: {p} (skipped)")
+    targets = valid_targets
+    if not targets:
+        print("[FATAL] No valid watch paths found. Please update config.json or environment.")
+        raise SystemExit(1)
 
     for item in targets:
         p, coll, s, e, f = item
