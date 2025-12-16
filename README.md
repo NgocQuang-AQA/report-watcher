@@ -7,7 +7,7 @@ Công cụ theo dõi thư mục `report_history` và ghi nhận các thư mục 
 - Lưu thông tin vào MongoDB gồm: `name`, `path`, `size`, `time_insert`.
 
 ## Yêu cầu hệ thống
-- macOS hoặc Linux.
+- macOS, Windows hoặc Linux.
 - Python 3.10+ (đã kiểm thử với Python 3.14).
 - MongoDB chạy tại `mongodb://localhost:27017` hoặc địa chỉ bạn cấu hình.
 
@@ -38,6 +38,21 @@ Sửa file `config.json` theo nhu cầu. Ví dụ cấu hình hiện tại:
 - `database`: tên database.
 - `collection`: tên collection lưu dữ liệu.
 
+## Cấu hình theo môi trường (macOS/Windows)
+- Ứng dụng tự động chọn file cấu hình theo hệ điều hành:
+  - Trên Windows: ưu tiên `config.windows.json`, sau đó `config.json`.
+  - Trên macOS: ưu tiên `config.macos.json`, sau đó `config.json`.
+- Có thể override bằng biến môi trường `CONFIG_FILE` để chỉ định file cấu hình bất kỳ.
+- Log khởi động sẽ hiển thị file đang dùng: `[CONFIG] Using file: <tên_file>`.
+
+Ví dụ các file có sẵn:
+- `config.macos.json` dùng đường dẫn macOS:
+  - `/Users/gz-ngocquang/gz-project/global-qa/report_history`
+  - `/Users/gz-ngocquang/gz-project/global-cn/report_history`
+- `config.windows.json` dùng đường dẫn Windows:
+  - `D:/Project/global-qa/report_history`
+  - `D:/Project/global-cn/report_history`
+
 ## Chạy tool
 
 ```bash
@@ -51,6 +66,46 @@ Khi chạy thành công sẽ in:
 ```
 
 - Dừng chương trình: nhấn `Ctrl + C`.
+
+## Cài đặt & chạy theo môi trường
+
+### Local macOS
+- Tạo môi trường ảo và cài đặt:
+  ```bash
+  cd /Users/gz-ngocquang/Build\ SDET/report-watcher
+  python3 -m venv .venv
+  ./.venv/bin/python -m pip install -r requirements.txt
+  ```
+- Bảo đảm tồn tại các thư mục:
+  - `/Users/gz-ngocquang/gz-project/global-qa/report_history`
+  - `/Users/gz-ngocquang/gz-project/global-cn/report_history`
+- Chạy:
+  ```bash
+  # tự động chọn config.macos.json nếu có, hoặc chỉ định tường minh:
+  export CONFIG_FILE=config.macos.json
+  ./.venv/bin/python watcher.py
+  ```
+
+### Server Windows
+- Tạo môi trường ảo và cài đặt (Cmd):
+  ```cmd
+  cd D:\Project\report-watcher
+  python -m venv .venv
+  .venv\Scripts\python -m pip install -r requirements.txt
+  ```
+- Bảo đảm tồn tại các thư mục:
+  - `D:\Project\global-qa\report_history`
+  - `D:\Project\global-cn\report_history`
+- Chạy (Cmd):
+  ```cmd
+  set CONFIG_FILE=config.windows.json
+  .venv\Scripts\python watcher.py
+  ```
+- Chạy (PowerShell):
+  ```powershell
+  $env:CONFIG_FILE = 'config.windows.json'
+  .\.venv\Scripts\python watcher.py
+  ```
 
 ## Kiểm thử nhanh
 1. Mở Finder tới `watch_path`.
@@ -84,10 +139,12 @@ Ghi chú: hệ thống kiểm tra trùng theo `name + path`. Nếu đã tồn t�
 - Không thấy log sự kiện:
   - Đảm bảo bạn tạo/xóa thư mục trực tiếp trong `watch_path`.
   - Đã bật theo dõi đệ quy và đồng bộ định kỳ.
+ - Trên Windows: nếu JSON cấu hình dùng `\`, hãy escape `\` thành `\\` hoặc dùng ký tự `/` (ví dụ `D:/Project/...`).
+ - Nếu một `watch_path` không tồn tại, ứng dụng sẽ ghi `[WARN] ... (skipped)` và bỏ qua path đó.
 
 ## Tuỳ chọn nâng cao
 - Đổi `database`/`collection` để tách dữ liệu theo môi trường khác nhau (ví dụ `global-qa`, `global-cn`).
-- Có thể override cấu hình bằng biến môi trường: `WATCH_PATH`, `MONGO_URI`, `DB_NAME`, `COLLECTION`, `RECURSIVE`, `SYNC_INTERVAL_SECONDS`.
+- Có thể override cấu hình bằng biến môi trường: `CONFIG_FILE`, `WATCH_PATH`, `MONGO_URI`, `DB_NAME`, `COLLECTION`, `RECURSIVE`, `SYNC_INTERVAL_SECONDS`.
 
 ## Chạy bằng Docker
 
@@ -119,7 +176,7 @@ Ghi chú:
 - Trên Linux dùng `MONGO_URI=mongodb://localhost:27017` nếu MongoDB chạy cùng máy/container network.
 - Nếu không dùng nhiều thư mục, có thể đặt `WATCH_PATH`/`COLLECTION` qua biến môi trường để theo dõi 1 thư mục.
 
-### Server WBL (Windows chạy Ubuntu qua WSL) – hai thư mục
+### Server WBL (Windows chạy Ubuntu qua WSL) – hai thư mục (tuỳ chọn)
 
 Sử dụng `docker-compose.yml` kèm `config.docker.json` (đã có sẵn trong repo) để mount hai thư mục WSL:
 

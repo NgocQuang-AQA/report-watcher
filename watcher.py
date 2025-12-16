@@ -3,13 +3,34 @@ import time
 import json
 import hashlib
 from datetime import datetime
+import platform
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from pymongo import MongoClient
 
-# Load config
-with open("config.json") as f:
+def _select_config_file():
+    env_file = os.getenv("CONFIG_FILE")
+    if env_file and os.path.isfile(env_file):
+        return env_file
+    sysname = platform.system().lower()
+    if sysname == "windows":
+        for n in ("config.windows.json", "config.json"):
+            if os.path.isfile(n):
+                return n
+    elif sysname == "darwin":
+        for n in ("config.macos.json", "config.json"):
+            if os.path.isfile(n):
+                return n
+    else:
+        for n in ("config.json",):
+            if os.path.isfile(n):
+                return n
+    return "config.json"
+
+_cfg_file = _select_config_file()
+with open(_cfg_file) as f:
     config = json.load(f)
+print(f"[CONFIG] Using file: {_cfg_file}")
 
 WATCH_PATH = os.getenv("WATCH_PATH", config["watch_path"]) if "watch_path" in config else None
 MONGO_URI = os.getenv("MONGO_URI", config["mongo_uri"])
