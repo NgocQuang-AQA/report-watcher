@@ -6,7 +6,8 @@ from datetime import datetime
 import platform
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
-from pymongo import MongoClient
+from pymongo import MongoClient, ASCENDING
+from pymongo.errors import DuplicateKeyError
 
 def _select_config_file():
     env_file = os.getenv("CONFIG_FILE")
@@ -55,12 +56,13 @@ def folder_size(path):
 
 
 class FolderHandler(FileSystemEventHandler):
-    def __init__(self, coll, base_path, summary_coll, error_coll, fail_coll):
+    def __init__(self, coll, base_path, summary_coll, error_coll, fail_coll, key=None):
         self.collection = coll
         self.base_path = base_path
         self.summary_coll = summary_coll
         self.error_coll = error_coll
         self.fail_coll = fail_coll
+        self.key = key
 
     def process_folder(self, folder_path):
         """Ghi dữ liệu folder cấp 1 vào DB nếu chưa tồn tại."""
@@ -69,23 +71,27 @@ class FolderHandler(FileSystemEventHandler):
         if parent != self.base_path:
             return
 
-        # check trùng bằng name + path
-        existing = self.collection.find_one({"name": name, "path": folder_path})
-        if existing:
-            print(f"[SKIP] Folder already exists: {name}")
-            return
-
         data = {
             "name": name,
             "path": folder_path,
             "time_insert": datetime.now()
         }
 
-        self.collection.insert_one(data)
-        print(f"[INSERT] Added folder: {name}")
-        update_summary(self.base_path, self.collection, self.summary_coll)
-        update_error_summary(self.base_path, self.error_coll)
-        update_fail_summary(self.base_path, self.fail_coll)
+        try:
+            res = self.collection.update_one(
+                {"name": name, "path": folder_path},
+                {"$setOnInsert": data},
+                upsert=True
+            )
+            if getattr(res, "upserted_id", None):
+                print(f"[INSERT] Added folder: {name}")
+            else:
+                print(f"[SKIP] Folder already exists: {name}")
+        except DuplicateKeyError:
+            print(f"[SKIP] Folder already exists (dupe key): {name}")
+        update_summary(self.base_path, self.collection, self.summary_coll, self.key)
+        update_error_summary(self.base_path, self.error_coll, self.key)
+        update_fail_summary(self.base_path, self.fail_coll, self.key)
 
     def on_created(self, event):
         try:
@@ -104,9 +110,9 @@ class FolderHandler(FileSystemEventHandler):
                 print(f"[EVENT] Folder deleted: {event.src_path}")
                 self.collection.delete_one({"name": name, "path": event.src_path})
                 print(f"[DELETE] Removed from DB: {name}")
-                update_summary(self.base_path, self.collection, self.summary_coll)
-                update_error_summary(self.base_path, self.error_coll)
-                update_fail_summary(self.base_path, self.fail_coll)
+                update_summary(self.base_path, self.collection, self.summary_coll, self.key)
+                update_error_summary(self.base_path, self.error_coll, self.key)
+                update_fail_summary(self.base_path, self.fail_coll, self.key)
         except Exception as e:
             print(f"[ERROR] on_deleted: {e}")
 
@@ -124,9 +130,9 @@ class FolderHandler(FileSystemEventHandler):
                 if os.path.dirname(event.dest_path) == self.base_path:
                     self.process_folder(event.dest_path)
                     print(f"[EVENT] Folder moved into base: {event.dest_path}")
-                    update_summary(self.base_path, self.collection, self.summary_coll)
-                    update_error_summary(self.base_path, self.error_coll)
-                    update_fail_summary(self.base_path, self.fail_coll)
+                    update_summary(self.base_path, self.collection, self.summary_coll, self.key)
+                    update_error_summary(self.base_path, self.error_coll, self.key)
+                    update_fail_summary(self.base_path, self.fail_coll, self.key)
         except Exception as e:
             print(f"[ERROR] on_moved: {e}")
 
@@ -136,13 +142,20 @@ def sync_target(base_path, coll):
         for entry in os.scandir(base_path):
             if entry.is_dir():
                 name = os.path.basename(entry.path)
-                if not coll.find_one({"name": name, "path": entry.path}):
-                    coll.insert_one({
-                        "name": name,
-                        "path": entry.path,
-                        "time_insert": datetime.now()
-                    })
-                    print(f"[SYNC] Added folder: {name}")
+                try:
+                    res = coll.update_one(
+                        {"name": name, "path": entry.path},
+                        {"$setOnInsert": {
+                            "name": name,
+                            "path": entry.path,
+                            "time_insert": datetime.now()
+                        }},
+                        upsert=True
+                    )
+                    if getattr(res, "upserted_id", None):
+                        print(f"[SYNC] Added folder: {name}")
+                except DuplicateKeyError:
+                    pass
         for doc in coll.find({}, {"name": 1, "path": 1}):
             p = doc.get("path")
             if isinstance(p, str) and p.startswith(base_path) and not os.path.isdir(p):
@@ -155,6 +168,31 @@ def sync_target(base_path, coll):
                 print(f"[SYNC] Removed nested: {doc.get('name')}")
     except Exception as e:
         print(f"[ERROR] Sync failed: {e}")
+
+def deduplicate(coll, base_path):
+    try:
+        docs = list(coll.find({"path": {"$regex": f"^{base_path}"}}))
+        groups = {}
+        for d in docs:
+            k = (d.get("name"), d.get("path"))
+            arr = groups.get(k) or []
+            arr.append(d)
+            groups[k] = arr
+        for k, arr in groups.items():
+            if len(arr) > 1:
+                arr_sorted = sorted(arr, key=lambda x: x.get("time_insert") or datetime.min, reverse=True)
+                keep = arr_sorted[0]
+                for d in arr_sorted[1:]:
+                    coll.delete_one({"_id": d["_id"]})
+                print(f"[DEDUP] Removed {len(arr_sorted)-1} duplicates for {k[0]}")
+    except Exception as e:
+        print(f"[ERROR] Dedup failed: {e}")
+
+def ensure_indexes(coll):
+    try:
+        coll.create_index([("name", ASCENDING), ("path", ASCENDING)], unique=True)
+    except Exception as e:
+        print(f"[WARN] Create unique index failed: {e}")
 
 def count_results(base_path):
     passing = 0
@@ -189,7 +227,7 @@ def count_results(base_path):
         'total': passing + broken_flaky + failed
     }
 
-def update_summary(base_path, coll_folders, coll_summary):
+def update_summary(base_path, coll_folders, coll_summary, key=None):
     counts = count_results(base_path)
     earliest = None
     latest = None
@@ -203,6 +241,7 @@ def update_summary(base_path, coll_folders, coll_summary):
         pass
     payload = {
         'path': base_path,
+        'key': key,
         'passing': counts['passing'],
         'broken_flaky': counts['broken_flaky'],
         'failed': counts['failed'],
@@ -217,7 +256,7 @@ def update_summary(base_path, coll_folders, coll_summary):
     except Exception as e:
         print(f"[ERROR] Summary upsert failed: {e}")
 
-def update_error_summary(base_path, coll_error, top_n:int=10, examples_per:int=5):
+def update_error_summary(base_path, coll_error, key=None, top_n:int=10, examples_per:int=5):
     total_error = 0
     cause_counts = {}
     cause_examples = {}
@@ -278,6 +317,7 @@ def update_error_summary(base_path, coll_error, top_n:int=10, examples_per:int=5
         ex = {c: cause_examples.get(c, []) for c in top_causes}
         payload = {
             'path': base_path,
+            'key': key,
             'totalError': total_error,
             'rootCause': top_causes,
             'ex': ex,
@@ -288,7 +328,7 @@ def update_error_summary(base_path, coll_error, top_n:int=10, examples_per:int=5
     except Exception as e:
         print(f"[ERROR] Error summary upsert failed: {e}")
 
-def update_fail_summary(base_path, coll_fail, top_n:int=10, examples_per:int=5):
+def update_fail_summary(base_path, coll_fail, key=None, top_n:int=10, examples_per:int=5):
     total_fail = 0
     cause_counts = {}
     cause_examples = {}
@@ -349,6 +389,7 @@ def update_fail_summary(base_path, coll_fail, top_n:int=10, examples_per:int=5):
         ex = {c: cause_examples.get(c, []) for c in top_causes}
         payload = {
             'path': base_path,
+            'key': key,
             'totalFail': total_fail,
             'rootCause': top_causes,
             'ex': ex,
@@ -369,11 +410,12 @@ if __name__ == "__main__":
             s = t.get("summary_collection")
             e = t.get("error_collection")
             f = t.get("fail_collection")
+            k = t.get("key") or c
             if p and c:
-                targets.append((p, db[c], db[s] if s else db[c+"-summary"], db[e] if e else db[c+"-error"], db[f] if f else db[c+"-fail"]))
+                targets.append((p, db[c], db[s] if s else db[c+"-summary"], db[e] if e else db[c+"-error"], db[f] if f else db[c+"-fail"], k))
     else:
         if WATCH_PATH and COLLECTION_NAME:
-            targets.append((WATCH_PATH, db[COLLECTION_NAME], db[COLLECTION_NAME+"-summary"], db[COLLECTION_NAME+"-error"], db[COLLECTION_NAME+"-fail"]))
+            targets.append((WATCH_PATH, db[COLLECTION_NAME], db[COLLECTION_NAME+"-summary"], db[COLLECTION_NAME+"-error"], db[COLLECTION_NAME+"-fail"], COLLECTION_NAME))
     valid_targets = []
     for item in targets:
         p = item[0]
@@ -388,17 +430,19 @@ if __name__ == "__main__":
         raise SystemExit(1)
 
     for item in targets:
-        p, coll, s, e, f = item
+        p, coll, s, e, f, k = item
+        deduplicate(coll, p)
+        ensure_indexes(coll)
         sync_target(p, coll)
-        update_summary(p, coll, s)
-        update_error_summary(p, e)
-        update_fail_summary(p, f)
+        update_summary(p, coll, s, k)
+        update_error_summary(p, e, k)
+        update_fail_summary(p, f, k)
 
     observer = Observer()
     handlers = []
     for item in targets:
-        p, coll, s, e, f = item
-        h = FolderHandler(coll, p, s, e, f)
+        p, coll, s, e, f, k = item
+        h = FolderHandler(coll, p, s, e, f, k)
         handlers.append(h)
         observer.schedule(h, p, recursive=RECURSIVE)
     observer.start()
@@ -409,11 +453,11 @@ if __name__ == "__main__":
             time.sleep(1)
             if time.time() - last_sync >= SYNC_INTERVAL_SECONDS:
                 for item in targets:
-                    p, coll, s, e, f = item
+                    p, coll, s, e, f, k = item
                     sync_target(p, coll)
-                    update_summary(p, coll, s)
-                    update_error_summary(p, e)
-                    update_fail_summary(p, f)
+                    update_summary(p, coll, s, k)
+                    update_error_summary(p, e, k)
+                    update_fail_summary(p, f, k)
                 last_sync = time.time()
     except KeyboardInterrupt:
         observer.stop()

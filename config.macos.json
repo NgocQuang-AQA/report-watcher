@@ -7,16 +7,34 @@
     {
       "watch_path": "/Users/gz-ngocquang/gz-project/global-qa/report_history",
       "collection": "global-qa",
-      "summary_collection": "qa-summary",
-      "error_collection": "qa-error",
-      "fail_collection": "qa-fail"
+      "summary_collection": "report-summary",
+      "error_collection": "report-error",
+      "fail_collection": "report-fail",
+      "key": "global-qa"
     },
     {
       "watch_path": "/Users/gz-ngocquang/gz-project/global-cn/report_history",
-      "collection": "global-cn",
-      "summary_collection": "cn-summary",
-      "error_collection": "cn-error",
-      "fail_collection": "cn-fail"
+      "collection": "cn-qa",
+      "summary_collection": "report-summary",
+      "error_collection": "report-error",
+      "fail_collection": "report-fail",
+      "key": "cn-qa"
+    },
+    {
+      "watch_path": "/Users/gz-ngocquang/gz-project/global-live/report_history",
+      "collection": "global-live",
+      "summary_collection": "report-summary",
+      "error_collection": "report-error",
+      "fail_collection": "report-fail",
+      "key": "global-live"
+    },
+    {
+      "watch_path": "/Users/gz-ngocquang/gz-project/globalcn-live/report_history",
+      "collection": "cn-live",
+      "summary_collection": "report-summary",
+      "error_collection": "report-error",
+      "fail_collection": "report-fail",
+      "key": "cn-live"
     }
   ]
 }
