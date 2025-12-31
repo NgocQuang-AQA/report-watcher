@@ -8,6 +8,7 @@ from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 from pymongo import MongoClient, ASCENDING
 from pymongo.errors import DuplicateKeyError
+import re
 
 def _select_config_file():
     env_file = os.getenv("CONFIG_FILE")
@@ -39,10 +40,206 @@ DB_NAME = os.getenv("DB_NAME", config["database"])
 COLLECTION_NAME = os.getenv("COLLECTION", config.get("collection", "")) if "collection" in config else ""
 RECURSIVE = os.getenv("RECURSIVE", "true").lower() == "true"
 SYNC_INTERVAL_SECONDS = int(os.getenv("SYNC_INTERVAL_SECONDS", "30"))
+ENV_KEY_NAME = os.getenv("ENV_KEY")
+REFRESH_TEST_RUNS = os.getenv("REFRESH_TEST_RUNS", "false").lower() == "true"
+EXIT_AFTER_REFRESH = os.getenv("EXIT_AFTER_REFRESH", "false").lower() == "true"
 
 # MongoDB
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
+
+def _utc_now():
+    return datetime.utcnow()
+
+def _read_json(fp):
+    try:
+        with open(fp) as fh:
+            return json.load(fh)
+    except Exception:
+        return None
+
+def _read_properties(fp):
+    result = {}
+    try:
+        with open(fp) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if "=" in line:
+                    k, v = line.split("=", 1)
+                    result[k.strip()] = v.strip()
+    except Exception:
+        pass
+    return result
+
+def _folder_start_time(folder_path):
+    try:
+        st = os.stat(folder_path)
+        ts = None
+        if hasattr(st, "st_birthtime") and st.st_birthtime:
+            ts = st.st_birthtime
+        else:
+            ts = st.st_mtime
+        return datetime.utcfromtimestamp(ts)
+    except Exception:
+        return _utc_now()
+
+def _parse_summary_txt(folder_path):
+    fp = os.path.join(folder_path, "summary.txt")
+    if not os.path.isfile(fp):
+        return None
+    result = {
+        "start_time_str": None,
+        "total": None,
+        "passed": None,
+        "failed": None,
+        "broken": None,
+        "pending": None,
+        "ignored": None,
+        "skipped": None,
+        "compromised": None
+    }
+    try:
+        with open(fp, encoding="utf-8") as fh:
+            text = fh.read()
+        m = re.search(r"Serenity report generated\s+(\d{2}-\d{2}-\d{4}\s+\d{2}:\d{2}:\d{2})", text)
+        if m:
+            result["start_time_str"] = m.group(1)
+        def grab(label, key):
+            mm = re.search(label + r"\s*:\s*(\d+)", text, re.IGNORECASE)
+            if mm:
+                result[key] = int(mm.group(1))
+        grab(r"Number of test cases", "total")
+        grab(r"Passed", "passed")
+        grab(r"Failed", "failed")
+        grab(r"Failed with errors", "broken")
+        grab(r"Pending", "pending")
+        grab(r"Ignored", "ignored")
+        grab(r"Skipped", "skipped")
+        grab(r"Compromised", "compromised")
+    except Exception:
+        return None
+    return result
+
+def _mask_headers(h):
+    if not isinstance(h, dict):
+        return None
+    out = {}
+    for k, v in h.items():
+        if isinstance(k, str) and k.lower() == "authorization":
+            out[k] = "***"
+        else:
+            out[k] = v
+    return out
+
+def _to_snake(s):
+    if not isinstance(s, str) or not s:
+        return None
+    s = re.sub(r"[^\w]+", "_", s)
+    s = re.sub(r"_{2,}", "_", s).strip("_")
+    return s.lower()
+
+def _collect_steps(obj):
+    steps = []
+    if isinstance(obj, dict):
+        if isinstance(obj.get("steps"), list):
+            steps.extend(obj.get("steps"))
+        if isinstance(obj.get("testSteps"), list):
+            steps.extend(obj.get("testSteps"))
+    return steps
+
+def _extract_req_res(step):
+    req = None
+    res = None
+    if isinstance(step, dict):
+        r = step.get("restQuery") or step.get("request")
+        if isinstance(r, dict):
+            url = r.get("path") or r.get("url")
+            try:
+                if isinstance(url, str):
+                    url = url.replace("`", "").strip()
+            except Exception:
+                pass
+            ctype = r.get("contentType")
+            content = r.get("content")
+            rh = r.get("requestHeaders")
+            cbody = r.get("responseBody")
+            sc = r.get("statusCode")
+            parts = []
+            try:
+                s = rh if isinstance(rh, str) else ""
+                s = s.replace("`", "").replace("\r", "")
+                lines = [ln.strip() for ln in s.split("\n") if ln.strip()]
+                for ln in lines:
+                    m = re.match(r"^\s*([A-Za-z][A-Za-z\-]*)\s*[:=]\s*(.+)$", ln)
+                    if m:
+                        k = m.group(1).strip()
+                        v = m.group(2).strip()
+                        parts.append(f"--header '{k}: {v}'")
+            except Exception:
+                pass
+            if isinstance(ctype, str) and ctype:
+                parts.insert(0, f"--header 'Content-Type: {ctype}'")
+            curl = None
+            try:
+                base = f"curl --location --globoff '{url}'"
+                if parts:
+                    base += " \\\n" + " \\\n".join(parts)
+                if isinstance(content, str) and content:
+                    base += " \\\n" + f"--data '{content}'"
+                curl = base
+            except Exception:
+                curl = None
+            req = {
+                "method": r.get("method"),
+                "url": url,
+                "content": content,
+                "contentType": ctype,
+                "requestHeaders": rh,
+                "responseBody": cbody,
+                "statusCode": sc,
+                "cUrl": curl
+            }
+        rr = step.get("restResponse") or step.get("response")
+        if isinstance(rr, dict):
+            res = {
+                "status": rr.get("status") or rr.get("statusCode"),
+                "body": rr.get("body")
+            }
+    return req, res
+
+def _flatten_steps(steps):
+    flat = []
+    def walk(arr):
+        for s in arr or []:
+            flat.append(s)
+            children = s.get("children") or s.get("steps") or s.get("testSteps")
+            if isinstance(children, list) and children:
+                walk(children)
+    walk(steps or [])
+    return flat
+
+def _compute_case_duration(d):
+    dur = d.get("duration")
+    if isinstance(dur, (int, float)):
+        return int(dur)
+    steps = _collect_steps(d)
+    total = 0
+    for s in steps:
+        sd = s.get("duration")
+        if isinstance(sd, (int, float)):
+            total += int(sd)
+    return total
+
+def ensure_run_indexes(db):
+    try:
+        db["test-runs"].create_index([("runId", ASCENDING)], unique=True)
+        db["test-cases"].create_index([("runId", ASCENDING), ("testCaseId", ASCENDING)], unique=True)
+        db["test-steps"].create_index([("runId", ASCENDING), ("testCaseId", ASCENDING), ("stepOrder", ASCENDING)], unique=True)
+        db["attachments"].create_index([("runId", ASCENDING), ("testCaseId", ASCENDING), ("name", ASCENDING), ("path", ASCENDING)], unique=False)
+    except Exception as e:
+        print(f"[WARN] Create run indexes failed: {e}")
 
 
 def folder_size(path):
@@ -89,6 +286,10 @@ class FolderHandler(FileSystemEventHandler):
                 print(f"[SKIP] Folder already exists: {name}")
         except DuplicateKeyError:
             print(f"[SKIP] Folder already exists (dupe key): {name}")
+        try:
+            process_run_folder(folder_path, self.key)
+        except Exception as e:
+            print(f"[ERROR] process_run_folder: {e}")
         update_summary(self.base_path, self.collection, self.summary_coll, self.key)
         update_error_summary(self.base_path, self.error_coll, self.key)
         update_fail_summary(self.base_path, self.fail_coll, self.key)
@@ -198,6 +399,7 @@ def count_results(base_path):
     passing = 0
     broken_flaky = 0
     failed = 0
+    skipped = 0
     try:
         for root, dirs, files in os.walk(base_path):
             for f in files:
@@ -216,6 +418,8 @@ def count_results(base_path):
                                 broken_flaky += 1
                             elif v == 'FAILURE':
                                 failed += 1
+                            elif v in ('PENDING', 'SKIPPED'):
+                                skipped += 1
                     except Exception:
                         pass
     except Exception:
@@ -224,7 +428,8 @@ def count_results(base_path):
         'passing': passing,
         'broken_flaky': broken_flaky,
         'failed': failed,
-        'total': passing + broken_flaky + failed
+        'skipped': skipped,
+        'total': passing + broken_flaky + failed + skipped
     }
 
 def update_summary(base_path, coll_folders, coll_summary, key=None):
@@ -245,6 +450,7 @@ def update_summary(base_path, coll_folders, coll_summary, key=None):
         'passing': counts['passing'],
         'broken_flaky': counts['broken_flaky'],
         'failed': counts['failed'],
+        'skipped': counts['skipped'],
         'total': counts['total'],
         'first_time': earliest,
         'latest_time': latest,
@@ -255,6 +461,178 @@ def update_summary(base_path, coll_folders, coll_summary, key=None):
         print(f"[SUMMARY] Upsert for {base_path}: total={counts['total']}")
     except Exception as e:
         print(f"[ERROR] Summary upsert failed: {e}")
+
+def _build_run_payload(folder_path, project_key=None):
+    run_id = os.path.basename(folder_path)
+    sum_txt = _parse_summary_txt(folder_path)
+    fallback_counts = count_results(folder_path)
+    start_time_str = sum_txt.get("start_time_str") if isinstance(sum_txt, dict) else None
+    if not start_time_str:
+        try:
+            st = _folder_start_time(folder_path)
+            start_time_str = st.strftime("%d-%m-%Y %H:%M:%S")
+        except Exception:
+            start_time_str = None
+    payload = {
+        "runId": run_id,
+        "project": project_key,
+        "startTime": start_time_str,
+        "summary": {
+            "total": (sum_txt.get("total") if sum_txt and sum_txt.get("total") is not None else fallback_counts["total"]),
+            "passed": (sum_txt.get("passed") if sum_txt and sum_txt.get("passed") is not None else fallback_counts["passing"]),
+            "failed": (sum_txt.get("failed") if sum_txt and sum_txt.get("failed") is not None else fallback_counts["failed"]),
+            "broken": (sum_txt.get("broken") if sum_txt and sum_txt.get("broken") is not None else fallback_counts["broken_flaky"]),
+            "skipped": (sum_txt.get("skipped") if sum_txt and sum_txt.get("skipped") is not None else fallback_counts.get("skipped")),
+            "pending": (sum_txt.get("pending") if sum_txt else None),
+            "ignored": (sum_txt.get("ignored") if sum_txt else None),
+            "compromised": (sum_txt.get("compromised") if sum_txt else None)
+        },
+        "source": {
+            "tool": "serenity",
+            "reportPath": folder_path
+        },
+        "createdAt": _utc_now()
+    }
+    return payload
+
+def refresh_runs_for_path(base_path, project_key=None):
+    coll_runs = db["test-runs"]
+    ensure_run_indexes(db)
+    try:
+        for entry in os.scandir(base_path):
+            if entry.is_dir():
+                p = entry.path
+                payload = _build_run_payload(p, project_key)
+                coll_runs.update_one({"runId": payload["runId"]}, {"$set": payload}, upsert=True)
+                print(f"[REFRESH] test-runs: {payload['runId']} updated")
+    except Exception as e:
+        print(f"[ERROR] refresh_runs_for_path failed: {e}")
+
+def process_run_folder(folder_path, project_key=None):
+    run_id = os.path.basename(folder_path)
+    coll_runs = db["test-runs"]
+    coll_cases = db["test-cases"]
+    coll_steps = db["test-steps"]
+    coll_atts = db["attachments"]
+    try:
+        payload = _build_run_payload(folder_path, project_key)
+        coll_runs.update_one({"runId": run_id}, {"$set": payload}, upsert=True)
+    except Exception as e:
+        print(f"[ERROR] Insert test-runs failed: {e}")
+    try:
+        for root, dirs, files in os.walk(folder_path):
+            for f in files:
+                if not f.lower().endswith(".json"):
+                    continue
+                if f in ("serenity.configuration.json", "bootstrap-icons.json", "serenity-summary.json"):
+                    continue
+                fp = os.path.join(root, f)
+                data = _read_json(fp)
+                if not isinstance(data, dict):
+                    continue
+                name = data.get("name") or data.get("title")
+                tcid = _to_snake(os.path.splitext(f)[0]) or _to_snake(name) or os.path.splitext(f)[0]
+                feature = data.get("feature")
+                story = None
+                tags_arr = []
+                tags = data.get("tags")
+                if isinstance(tags, list):
+                    for t in tags:
+                        if isinstance(t, dict):
+                            tn = t.get("name") or t.get("tag")
+                            tt = t.get("type") or t.get("tagType")
+                            if isinstance(tt, str) and tt.lower() in ("feature", "story") and not feature:
+                                feature = tn
+                            if isinstance(tt, str) and tt.lower() == "story" and not story:
+                                story = tn
+                            if tn:
+                                tags_arr.append(str(tn))
+                us = data.get("userStory")
+                if isinstance(us, dict):
+                    story = story or us.get("storyName") or us.get("name")
+                    feature = feature or us.get("path")
+                status = data.get("result")
+                duration_case = _compute_case_duration(data)
+                err = None
+                tfc = data.get("testFailureCause")
+                if isinstance(tfc, dict):
+                    err = tfc.get("message") or tfc.get("errorType")
+                elif isinstance(tfc, str):
+                    err = tfc
+                has_steps = bool(_collect_steps(data))
+                has_att = bool(data.get("attachments") or data.get("screenshots"))
+                case_doc = {
+                    "runId": run_id,
+                    "testCaseId": tcid,
+                    "name": name,
+                    "feature": feature,
+                    "story": story,
+                    "tags": tags_arr,
+                    "status": str(status).upper() if status else None,
+                    "duration": duration_case,
+                    "errorMessage": err,
+                    "hasSteps": has_steps,
+                    "hasAttachment": has_att,
+                    "createdAt": _utc_now()
+                }
+                try:
+                    coll_cases.update_one({"runId": run_id, "testCaseId": tcid}, {"$set": case_doc}, upsert=True)
+                except Exception:
+                    pass
+                steps = _flatten_steps(_collect_steps(data))
+                order = 1
+                for s in steps:
+                    req, res = _extract_req_res(s)
+                    sdoc = {
+                        "runId": run_id,
+                        "testCaseId": tcid,
+                        "stepOrder": order,
+                        "name": s.get("description") or s.get("name"),
+                        "status": s.get("result"),
+                        "duration": s.get("duration"),
+                        "request": req,
+                        "response": res,
+                        "error": s.get("error"),
+                        "createdAt": _utc_now()
+                    }
+                    try:
+                        coll_steps.update_one({"runId": run_id, "testCaseId": tcid, "stepOrder": order}, {"$set": sdoc}, upsert=True)
+                    except Exception:
+                        pass
+                    order += 1
+                atts = []
+                a = data.get("attachments")
+                if isinstance(a, list):
+                    for it in a:
+                        if isinstance(it, dict):
+                            atts.append(it)
+                sc = data.get("screenshots")
+                if isinstance(sc, list):
+                    for it in sc:
+                        if isinstance(it, dict):
+                            atts.append(it)
+                for it in atts:
+                    nm = it.get("name") or it.get("title")
+                    pth = it.get("path") or it.get("source")
+                    typ = it.get("type") or it.get("format")
+                    adoc = {
+                        "runId": run_id,
+                        "testCaseId": tcid,
+                        "name": nm,
+                        "type": typ,
+                        "path": pth,
+                        "createdAt": _utc_now()
+                    }
+                    try:
+                        coll_atts.update_one(
+                            {"runId": run_id, "testCaseId": tcid, "name": nm, "path": pth},
+                            {"$set": adoc},
+                            upsert=True
+                        )
+                    except Exception:
+                        pass
+    except Exception as e:
+        print(f"[ERROR] Parse run folder failed: {e}")
 
 def update_error_summary(base_path, coll_error, key=None, top_n:int=10, examples_per:int=5):
     total_error = 0
@@ -433,7 +811,16 @@ if __name__ == "__main__":
         p, coll, s, e, f, k = item
         deduplicate(coll, p)
         ensure_indexes(coll)
+        ensure_run_indexes(db)
+        if REFRESH_TEST_RUNS:
+            refresh_runs_for_path(p, k)
         sync_target(p, coll)
+        try:
+            for entry in os.scandir(p):
+                if entry.is_dir():
+                    process_run_folder(entry.path, k)
+        except Exception as _e:
+            print(f"[WARN] Initial run parse failed for {p}: {_e}")
         update_summary(p, coll, s, k)
         update_error_summary(p, e, k)
         update_fail_summary(p, f, k)
@@ -451,10 +838,20 @@ if __name__ == "__main__":
     try:
         while True:
             time.sleep(1)
+            if REFRESH_TEST_RUNS and EXIT_AFTER_REFRESH:
+                break
             if time.time() - last_sync >= SYNC_INTERVAL_SECONDS:
                 for item in targets:
                     p, coll, s, e, f, k = item
+                    if REFRESH_TEST_RUNS:
+                        refresh_runs_for_path(p, k)
                     sync_target(p, coll)
+                    try:
+                        for entry in os.scandir(p):
+                            if entry.is_dir():
+                                process_run_folder(entry.path, k)
+                    except Exception as _e:
+                        print(f"[WARN] Periodic run parse failed for {p}: {_e}")
                     update_summary(p, coll, s, k)
                     update_error_summary(p, e, k)
                     update_fail_summary(p, f, k)
