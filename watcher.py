@@ -604,6 +604,11 @@ def process_run_folder(folder_path, project_key=None):
                         "error": s.get("error"),
                         "createdAt": _utc_now()
                     }
+                    if s.get("result") == "FAILURE":
+                        sdoc["exception"] = s.get("exception")
+                        sdoc["reportData"] = s.get("reportData")
+                    elif s.get("result") == "ERROR":
+                        sdoc["exception"] = s.get("exception")
                     try:
                         coll_steps.update_one({"runId": run_id, "testCaseId": tcid, "stepOrder": order}, {"$set": sdoc}, upsert=True)
                     except Exception:
