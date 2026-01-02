@@ -31,7 +31,6 @@ def _select_config_file():
 _cfg_file = _select_config_file()
 with open(_cfg_file) as f:
     config = json.load(f)
-log_watcher("CONFIG", f"Using file: {_cfg_file}")
 
 WATCH_PATH = os.getenv("WATCH_PATH", config["watch_path"]) if "watch_path" in config else None
 MONGO_URI = os.getenv("MONGO_URI", config["mongo_uri"])
@@ -57,6 +56,8 @@ def log_watcher(level, message):
         })
     except Exception as e:
         print(f"[ERROR] Log to DB failed: {e}")
+
+log_watcher("CONFIG", f"Using file: {_cfg_file}")
 
 def _utc_now():
     return datetime.utcnow()
