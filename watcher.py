@@ -1,7 +1,6 @@
 import os
 import time
 import json
-import hashlib
 from datetime import datetime
 import platform
 from watchdog.observers import Observer
@@ -32,7 +31,7 @@ def _select_config_file():
 _cfg_file = _select_config_file()
 with open(_cfg_file) as f:
     config = json.load(f)
-print(f"[CONFIG] Using file: {_cfg_file}")
+log_watcher("CONFIG", f"Using file: {_cfg_file}")
 
 WATCH_PATH = os.getenv("WATCH_PATH", config["watch_path"]) if "watch_path" in config else None
 MONGO_URI = os.getenv("MONGO_URI", config["mongo_uri"])
@@ -47,6 +46,17 @@ EXIT_AFTER_REFRESH = os.getenv("EXIT_AFTER_REFRESH", "false").lower() == "true"
 # MongoDB
 client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
+
+def log_watcher(level, message):
+    print(f"[{level}] {message}")
+    try:
+        db["log-watcher"].insert_one({
+            "level": level,
+            "message": message,
+            "timestamp": datetime.now()
+        })
+    except Exception as e:
+        print(f"[ERROR] Log to DB failed: {e}")
 
 def _utc_now():
     return datetime.utcnow()
@@ -239,11 +249,10 @@ def ensure_run_indexes(db):
         db["test-steps"].create_index([("runId", ASCENDING), ("testCaseId", ASCENDING), ("stepOrder", ASCENDING)], unique=True)
         db["attachments"].create_index([("runId", ASCENDING), ("testCaseId", ASCENDING), ("name", ASCENDING), ("path", ASCENDING)], unique=False)
     except Exception as e:
-        print(f"[WARN] Create run indexes failed: {e}")
+        log_watcher("WARN", f"Create run indexes failed: {e}")
 
 
 def folder_size(path):
-    """Tính dung lượng folder (bytes)."""
     total = 0
     for root, dirs, files in os.walk(path):
         for f in files:
@@ -262,7 +271,6 @@ class FolderHandler(FileSystemEventHandler):
         self.key = key
 
     def process_folder(self, folder_path):
-        """Ghi dữ liệu folder cấp 1 vào DB nếu chưa tồn tại."""
         name = os.path.basename(folder_path)
         parent = os.path.dirname(folder_path)
         if parent != self.base_path:
@@ -281,15 +289,15 @@ class FolderHandler(FileSystemEventHandler):
                 upsert=True
             )
             if getattr(res, "upserted_id", None):
-                print(f"[INSERT] Added folder: {name}")
+                log_watcher("INSERT", f"Added folder: {name}")
             else:
-                print(f"[SKIP] Folder already exists: {name}")
+                log_watcher("SKIP", f"Folder already exists: {name}")
         except DuplicateKeyError:
-            print(f"[SKIP] Folder already exists (dupe key): {name}")
+            log_watcher("SKIP", f"Folder already exists (dupe key): {name}")
         try:
             process_run_folder(folder_path, self.key)
         except Exception as e:
-            print(f"[ERROR] process_run_folder: {e}")
+            log_watcher("ERROR", f"process_run_folder: {e}")
         update_summary(self.base_path, self.collection, self.summary_coll, self.key)
         update_error_summary(self.base_path, self.error_coll, self.key)
         update_fail_summary(self.base_path, self.fail_coll, self.key)
@@ -298,24 +306,24 @@ class FolderHandler(FileSystemEventHandler):
         try:
             is_dir = event.is_directory or os.path.isdir(event.src_path)
             if is_dir and os.path.dirname(event.src_path) == self.base_path:
-                print(f"[EVENT] New folder detected: {event.src_path}")
+                log_watcher("EVENT", f"New folder detected: {event.src_path}")
                 self.process_folder(event.src_path)
         except Exception as e:
-            print(f"[ERROR] on_created: {e}")
+            log_watcher("ERROR", f"on_created: {e}")
 
     def on_deleted(self, event):
         try:
             is_dir = event.is_directory or os.path.isdir(event.src_path)
             if is_dir and os.path.dirname(event.src_path) == self.base_path:
                 name = os.path.basename(event.src_path)
-                print(f"[EVENT] Folder deleted: {event.src_path}")
+                log_watcher("EVENT", f"Folder deleted: {event.src_path}")
                 self.collection.delete_one({"name": name, "path": event.src_path})
-                print(f"[DELETE] Removed from DB: {name}")
+                log_watcher("DELETE", f"Removed from DB: {name}")
                 update_summary(self.base_path, self.collection, self.summary_coll, self.key)
                 update_error_summary(self.base_path, self.error_coll, self.key)
                 update_fail_summary(self.base_path, self.fail_coll, self.key)
         except Exception as e:
-            print(f"[ERROR] on_deleted: {e}")
+            log_watcher("ERROR", f"on_deleted: {e}")
 
     def on_moved(self, event):
         try:
@@ -325,17 +333,17 @@ class FolderHandler(FileSystemEventHandler):
                     old_name = os.path.basename(event.src_path)
                     try:
                         self.collection.delete_one({"name": old_name, "path": event.src_path})
-                        print(f"[DELETE] Removed from DB: {old_name}")
+                        log_watcher("DELETE", f"Removed from DB: {old_name}")
                     except Exception as e:
-                        print(f"[ERROR] Delete old failed: {old_name} - {e}")
+                        log_watcher("ERROR", f"Delete old failed: {old_name} - {e}")
                 if os.path.dirname(event.dest_path) == self.base_path:
                     self.process_folder(event.dest_path)
-                    print(f"[EVENT] Folder moved into base: {event.dest_path}")
+                    log_watcher("EVENT", f"Folder moved into base: {event.dest_path}")
                     update_summary(self.base_path, self.collection, self.summary_coll, self.key)
                     update_error_summary(self.base_path, self.error_coll, self.key)
                     update_fail_summary(self.base_path, self.fail_coll, self.key)
         except Exception as e:
-            print(f"[ERROR] on_moved: {e}")
+            log_watcher("ERROR", f"on_moved: {e}")
 
 
 def sync_target(base_path, coll):
@@ -354,21 +362,21 @@ def sync_target(base_path, coll):
                         upsert=True
                     )
                     if getattr(res, "upserted_id", None):
-                        print(f"[SYNC] Added folder: {name}")
+                        log_watcher("SYNC", f"Added folder: {name}")
                 except DuplicateKeyError:
                     pass
         for doc in coll.find({}, {"name": 1, "path": 1}):
             p = doc.get("path")
             if isinstance(p, str) and p.startswith(base_path) and not os.path.isdir(p):
                 coll.delete_one({"_id": doc["_id"]})
-                print(f"[SYNC] Removed stale: {doc.get('name')}")
+                log_watcher("SYNC", f"Removed stale: {doc.get('name')}")
         for doc in coll.find({"path": {"$regex": f"^{base_path}"}}, {"name": 1, "path": 1}):
             p = doc.get("path")
             if isinstance(p, str) and os.path.dirname(p) != base_path:
                 coll.delete_one({"_id": doc["_id"]})
-                print(f"[SYNC] Removed nested: {doc.get('name')}")
+                log_watcher("SYNC", f"Removed nested: {doc.get('name')}")
     except Exception as e:
-        print(f"[ERROR] Sync failed: {e}")
+        log_watcher("ERROR", f"Sync failed: {e}")
 
 def deduplicate(coll, base_path):
     try:
@@ -385,15 +393,15 @@ def deduplicate(coll, base_path):
                 keep = arr_sorted[0]
                 for d in arr_sorted[1:]:
                     coll.delete_one({"_id": d["_id"]})
-                print(f"[DEDUP] Removed {len(arr_sorted)-1} duplicates for {k[0]}")
+                log_watcher("DEDUP", f"Removed {len(arr_sorted)-1} duplicates for {k[0]}")
     except Exception as e:
-        print(f"[ERROR] Dedup failed: {e}")
+        log_watcher("ERROR", f"Dedup failed: {e}")
 
 def ensure_indexes(coll):
     try:
         coll.create_index([("name", ASCENDING), ("path", ASCENDING)], unique=True)
     except Exception as e:
-        print(f"[WARN] Create unique index failed: {e}")
+        log_watcher("WARN", f"Create unique index failed: {e}")
 
 def count_results(base_path):
     passing = 0
@@ -458,9 +466,9 @@ def update_summary(base_path, coll_folders, coll_summary, key=None):
     }
     try:
         coll_summary.update_one({'path': base_path}, {'$set': payload}, upsert=True)
-        print(f"[SUMMARY] Upsert for {base_path}: total={counts['total']}")
+        log_watcher("SUMMARY", f"Upsert for {base_path}: total={counts['total']}")
     except Exception as e:
-        print(f"[ERROR] Summary upsert failed: {e}")
+        log_watcher("ERROR", f"Summary upsert failed: {e}")
 
 def _build_run_payload(folder_path, project_key=None):
     run_id = os.path.basename(folder_path)
@@ -504,9 +512,9 @@ def refresh_runs_for_path(base_path, project_key=None):
                 p = entry.path
                 payload = _build_run_payload(p, project_key)
                 coll_runs.update_one({"runId": payload["runId"]}, {"$set": payload}, upsert=True)
-                print(f"[REFRESH] test-runs: {payload['runId']} updated")
+                log_watcher("REFRESH", f"test-runs: {payload['runId']} updated")
     except Exception as e:
-        print(f"[ERROR] refresh_runs_for_path failed: {e}")
+        log_watcher("ERROR", f"refresh_runs_for_path failed: {e}")
 
 def process_run_folder(folder_path, project_key=None):
     run_id = os.path.basename(folder_path)
@@ -518,7 +526,7 @@ def process_run_folder(folder_path, project_key=None):
         payload = _build_run_payload(folder_path, project_key)
         coll_runs.update_one({"runId": run_id}, {"$set": payload}, upsert=True)
     except Exception as e:
-        print(f"[ERROR] Insert test-runs failed: {e}")
+        log_watcher("ERROR", f"Insert test-runs failed: {e}")
     try:
         for root, dirs, files in os.walk(folder_path):
             for f in files:
@@ -632,7 +640,7 @@ def process_run_folder(folder_path, project_key=None):
                     except Exception:
                         pass
     except Exception as e:
-        print(f"[ERROR] Parse run folder failed: {e}")
+        log_watcher("ERROR", f"Parse run folder failed: {e}")
 
 def update_error_summary(base_path, coll_error, key=None, top_n:int=10, examples_per:int=5):
     total_error = 0
@@ -702,9 +710,9 @@ def update_error_summary(base_path, coll_error, key=None, top_n:int=10, examples
             'updated_at': datetime.now()
         }
         coll_error.update_one({'path': base_path}, {'$set': payload}, upsert=True)
-        print(f"[ERROR-SUMMARY] Upsert for {base_path}: totalError={total_error}, causes={len(top_causes)}")
+        log_watcher("ERROR-SUMMARY", f"Upsert for {base_path}: totalError={total_error}, causes={len(top_causes)}")
     except Exception as e:
-        print(f"[ERROR] Error summary upsert failed: {e}")
+        log_watcher("ERROR", f"Error summary upsert failed: {e}")
 
 def update_fail_summary(base_path, coll_fail, key=None, top_n:int=10, examples_per:int=5):
     total_fail = 0
@@ -774,9 +782,9 @@ def update_fail_summary(base_path, coll_fail, key=None, top_n:int=10, examples_p
             'updated_at': datetime.now()
         }
         coll_fail.update_one({'path': base_path}, {'$set': payload}, upsert=True)
-        print(f"[FAIL-SUMMARY] Upsert for {base_path}: totalFail={total_fail}, causes={len(top_causes)}")
+        log_watcher("FAIL-SUMMARY", f"Upsert for {base_path}: totalFail={total_fail}, causes={len(top_causes)}")
     except Exception as e:
-        print(f"[ERROR] Fail summary upsert failed: {e}")
+        log_watcher("ERROR", f"Fail summary upsert failed: {e}")
 
 if __name__ == "__main__":
     targets_cfg = config.get("targets") if isinstance(config, dict) else None
@@ -798,13 +806,13 @@ if __name__ == "__main__":
     for item in targets:
         p = item[0]
         if os.path.isdir(p):
-            print(f"===== Watching folder: {p} =====")
+            log_watcher("INFO", f"===== Watching folder: {p} =====")
             valid_targets.append(item)
         else:
-            print(f"[WARN] Watch path not found: {p} (skipped)")
+            log_watcher("WARN", f"Watch path not found: {p} (skipped)")
     targets = valid_targets
     if not targets:
-        print("[FATAL] No valid watch paths found. Please update config.json or environment.")
+        log_watcher("FATAL", "No valid watch paths found. Please update config.json or environment.")
         raise SystemExit(1)
 
     for item in targets:
@@ -820,7 +828,7 @@ if __name__ == "__main__":
                 if entry.is_dir():
                     process_run_folder(entry.path, k)
         except Exception as _e:
-            print(f"[WARN] Initial run parse failed for {p}: {_e}")
+            log_watcher("WARN", f"Initial run parse failed for {p}: {_e}")
         update_summary(p, coll, s, k)
         update_error_summary(p, e, k)
         update_fail_summary(p, f, k)
@@ -851,7 +859,7 @@ if __name__ == "__main__":
                             if entry.is_dir():
                                 process_run_folder(entry.path, k)
                     except Exception as _e:
-                        print(f"[WARN] Periodic run parse failed for {p}: {_e}")
+                        log_watcher("WARN", f"Periodic run parse failed for {p}: {_e}")
                     update_summary(p, coll, s, k)
                     update_error_summary(p, e, k)
                     update_fail_summary(p, f, k)
