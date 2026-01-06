@@ -133,6 +133,21 @@ def _parse_summary_txt(folder_path):
         return None
     return result
 
+def _extract_start_time_from_name(name):
+    try:
+        if not isinstance(name, str):
+            return None
+        m = re.search(r"(\d{4}-\d{2}-\d{2}-\d{2}-\d{2})", name)
+        if m:
+            s = m.group(1)
+            parts = s.split("-")
+            if len(parts) == 5:
+                return f"{parts[0]}-{parts[1]}-{parts[2]} {parts[3]}-{parts[4]}"
+            return s
+    except Exception:
+        pass
+    return None
+
 def _mask_headers(h):
     if not isinstance(h, dict):
         return None
@@ -475,11 +490,13 @@ def _build_run_payload(folder_path, project_key=None):
     run_id = os.path.basename(folder_path)
     sum_txt = _parse_summary_txt(folder_path)
     fallback_counts = count_results(folder_path)
-    start_time_str = sum_txt.get("start_time_str") if isinstance(sum_txt, dict) else None
+    start_time_str = _extract_start_time_from_name(run_id)
+    if not start_time_str:
+        start_time_str = sum_txt.get("start_time_str") if isinstance(sum_txt, dict) else None
     if not start_time_str:
         try:
             st = _folder_start_time(folder_path)
-            start_time_str = st.strftime("%d-%m-%Y %H:%M:%S")
+            start_time_str = st.strftime("%Y-%m-%d %H-%M")
         except Exception:
             start_time_str = None
     payload = {
